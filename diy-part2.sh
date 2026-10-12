@@ -220,3 +220,16 @@ if [ -f "$OSREL_TPL" ]; then
 fi
 
 echo "🎉 diy-part2.sh 执行完毕 (author=$FW_AUTHOR)"
+
+# ====== 开启HG5585F-CU DTS双USB控制器 ======
+DTS_FILE="openwrt/target/linux/airoha/dts/an758x/fiberhome_hg5585f-cu.dts"
+if [ -f "${DTS_FILE}" ]; then
+    # 匹配 usb@10000000 节点，修改里面status
+    sed -i '/usb@10000000/,+3 s/status = "disabled";/status = "okay";/' "${DTS_FILE}"
+    # 匹配 usb@10010000 节点，修改里面status
+    sed -i '/usb@10010000/,+3 s/status = "disabled";/status = "okay";/' "${DTS_FILE}"
+    echo "✅ CU DTS USB控制器已启用"
+else
+    echo "❌ 找不到CU dts文件: ${DTS_FILE}"
+fi
+

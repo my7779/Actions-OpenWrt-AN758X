@@ -1,11 +1,10 @@
 #!/bin/bash
 # ================================================================
-# diy-part2.sh —— 默认值定制（在 .config 加载之后运行）
-# 运行目录: ponwrt 源码根目录
-#
-#   1) 默认时区改成中国（Asia/Shanghai, CST-8）
-#   2) 5G WiFi：国家码 CN、信道 auto、频宽 160MHz
-#
+# diy-part2.sh —— 默认值定制（在 .config 加载之后运行，cwd = ponwrt 根）
+#   1) 时区 Asia/Shanghai (CST-8)
+#   2) 5G WiFi：CN / auto / HE160
+#   3) 概览页 CPU 行：USR/SYS + 每核明细
+#   4) 固件版本追加作者与构建时间
 # ================================================================
 
 set -euo pipefail
@@ -23,12 +22,13 @@ WIFI_5G_CHANNEL="${WIFI_5G_CHANNEL:-auto}"     # 信道（auto = 自动选择）
 WIFI_5G_HTMODE="${WIFI_5G_HTMODE:-HE160}"      # 160MHz（WiFi6）；回落 HE80
 WIFI_5G_FALLBACK="${WIFI_5G_FALLBACK:-HE80}"   # 硬件不支持 160MHz 时的回落值
 
-readonly FW_AUTHOR="qwe"
+# 可由 workflow 的 fw_author 输入项覆盖（经 env 注入）；本地单独跑时默认 qwe
+FW_AUTHOR="${FW_AUTHOR:-qwe}"
 FW_BUILD_TIME="${FW_BUILD_TIME:-}"
-FW_DESC_SUFFIX="${FW_DESC_SUFFIX:-}" 
+FW_DESC_SUFFIX="${FW_DESC_SUFFIX:-}"
 
 echo "配置：5G country=$WIFI_5G_COUNTRY channel=$WIFI_5G_CHANNEL htmode=$WIFI_5G_HTMODE fallback=$WIFI_5G_FALLBACK"
-echo "配置：FW_AUTHOR=$FW_AUTHOR (固定)"
+echo "配置：FW_AUTHOR=$FW_AUTHOR"
 
 # ---------------------------------------------------------
 # 1. 修改 config_generate 的默认值（首次开机生成的 /etc/config/system）
@@ -67,18 +67,21 @@ if [ -f .config ]; then
   sed -i '/^CONFIG_PACKAGE_zoneinfo-asia=/d; /^# CONFIG_PACKAGE_zoneinfo-asia is not set/d' .config
   echo "CONFIG_PACKAGE_zoneinfo-asia=y    # 亚洲时区数据库（中国时区需要）" >> .config
   echo "✅ zoneinfo-asia 已加入 .config"
+
+  # libffi：见 diy-part1.sh 的同名段落。源码树原本没有这个包，
+  # python3(3.14) 的 _ctypes 却必须要它的 ffi.h / libffi.pc，
+  # 缺了就 fatal error 拖垮 world。这里显式打开 target 版，
+  # 让 Build/InstallDev 把头文件装进 staging_dir。
+  sed -i '/^CONFIG_PACKAGE_libffi=/d; /^# CONFIG_PACKAGE_libffi is not set/d' .config
+  echo "CONFIG_PACKAGE_libffi=y           # python3 _ctypes 需要 ffi.h / libffi.pc" >> .config
+  echo "✅ libffi 已加入 .config"
 fi
 
 # ---------------------------------------------------------
-# 4. 5G WiFi：国家码 CN / 信道 auto / 频宽 160MHz
-#
-#    分两层落地：
-#      a) 编译期：改无线 detect 脚本的默认值（best effort，找不到就跳过）
-#      b) 运行期：uci-defaults 首启强制刷（主要手段，与保留配置升级都生效）
-#
-#    说明：不同版本 detect 脚本路径不同（有的叫 mac80211.sh / mac80211.uc），
-#    且 uci-defaults 执行时 /etc/config/wireless 可能尚未生成，
-#    故 uci-defaults 里自带「未生成就先生成」的逻辑。
+# 4. 5G WiFi：CN / auto / HE160
+#   分两层：编译期改 detect 脚本默认值（best effort，各版本路径不同）；
+#   运行期用 uci-defaults 首启强制刷（主要手段，保留配置升级也生效，且自带
+#   「wireless 尚未生成就先 wifi config」的逻辑）。
 # ---------------------------------------------------------
 
 # ---- 4a. 编译期：改 detect 脚本默认值（best effort） ----
@@ -186,6 +189,19 @@ if [ -f .config ]; then
   fi
 fi
 
+# ---------------------------------------------------------
+# 5. 概览页「CPU 使用率（%）」行：USR/SYS + 每核明细
+#   luci 原本是 popen("top -n1 | awk ...") 的单值。这里只把它改指到
+#   files/sbin/cpuusage，前端 10_system.js 与 ACL 都不动。
+#   纯显示层：找不到目标只 warning，不让它把几小时的构建搞挂。
+# ---------------------------------------------------------
+PATCH_CPUUSAGE="$(dirname "$0")/scripts/patch-luci-cpuusage.sh"
+if [ -f "$PATCH_CPUUSAGE" ]; then
+  PONWRT_DIR=. bash "$PATCH_CPUUSAGE" || true
+else
+  echo "::warning::未找到 $PATCH_CPUUSAGE，跳过概览页 CPU 使用率行定制"
+fi
+
 [ -z "$FW_BUILD_TIME" ] && FW_BUILD_TIME="$(TZ="${TZ:-Asia/Shanghai}" date '+%Y-%m-%d %H:%M')"
 
 VER_CODE="$(sed -n 's/^CONFIG_VERSION_CODE="\(.*\)"$/\1/p' .config 2>/dev/null || true)"
@@ -218,6 +234,12 @@ if [ -f "$OSREL_TPL" ]; then
   perl -i -pe 's/^OPENWRT_RELEASE=.*/$ENV{OSREL_LINE}/' "$OSREL_TPL"
   echo "✅ os-release 同步 -> $OSREL_LINE"
 fi
+
+# 用 -f 不要用 -x：git checkout / Windows 打包会丢可执行位，-x 判失败会静默整段跳过。
+# 末尾 || true：本文件开头是 set -euo pipefail，被 source 的子脚本里任何一步
+# 返回非 0 都会让这里当场退出，后面的步骤全不执行且整轮构建中断。
+# 加密是可选增强，不该有能力搞挂构建。
+[ -f scripts/diy-part2-crypto.sh ] && . ./scripts/diy-part2-crypto.sh || true
 
 echo "🎉 diy-part2.sh 执行完毕 (author=$FW_AUTHOR)"
 

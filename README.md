@@ -1,406 +1,210 @@
 # PonWrt CI — Airoha AN758x PON 云编译
 
-基于 P3TERX `Actions-OpenWrt` 模板重构，源码指向 [pbs05/ponwrt](https://github.com/pbs05/ponwrt)（默认分支 `master`），
-针对 AN7581 / AN7583 PON 光猫做机型选择、磁盘释放与工具链缓存。
+基于 P3TERX `Actions-OpenWrt` 模板重构，源码指向 [pbs05/ponwrt](https://github.com/pbs05/ponwrt)（默认分支 `master`）。
+产出 AN7581 / AN7583 PON 光猫的 OpenWrt 固件，带机型选择、磁盘释放和滚动构建缓存。
 
-## 目录结构
+## 快速开始
 
-```
-.github/workflows/build-ponwrt.yml     主构建流程（机型可选 / 释放空间 / 工具链缓冲）
-.github/workflows/cache-keepalive.yml  每 5 天 touch 缓存，防止被回收
-diy-part1.sh    拉取可选插件到 package/custom（passwall/openclash/mosdns/lucky/tailscale 等，默认全关）
-diy-part2.sh    默认值定制：① 时区改中国（Asia/Shanghai, CST-8）
-                ② 5G WiFi：国家码 CN / 信道 auto / 频宽 160MHz
-                ③ 固件版本后追加「作者 + 构建时间」
-configs/        每机型一份精简 diffconfig（约 440 行，需 make defconfig 展开）
-files/          自定义 rootfs 文件，会自动拷进源码（sbin/tempinfo + 两个 uci-defaults））
-packages/npu-clanker-template/   可选插件包的 Makefile 模板（占位符 @PKG_NAME@ 等）
-scripts/        NPU 固件脚本：
-                  build-npu-fw.sh         现编 ClankerNPU（拉源码 + riscv 工具链 + 体积自检）
-                  gen-npu-fw-package.sh   把编出的镜像包成「可选插件包」
-                  strip-default-npu-fw.sh 把 stock 固件从 target 的 DEFAULT_PACKAGES 里摘掉
-                  apply-npu-dts.sh        给机型 DTS 补 WiFi 卸载保留内存区 / firmware-name
-```
+免费 runner 单次上限 6 小时（job 350 分钟），首次全量编译（工具链 + 内核 + 全包）大概率超时，按这个顺序跑：
 
-## diy 脚本
+1. **Warm Build Cache** → `soc=an7581和an7583`、`prebuilt_host=预编译`，把工具链缓存建起来
+2. **Build PonWrt** → 选 `soc` / `profile` → `scope=firmware` 出固件
+3. 仍然超时：把 `configs/*.config` 里不需要的 luci-app / 语言包删掉再提交
 
-只有两个，职责单一：
+> 不预热也能直接跑 `firmware`——缓存是滚动式的，第一次跑完会自动存下工具链。预热只是给怕超时的人用的。
 
-### 索引判据：看 `tmp/.packageinfo`，不看 `package/feeds/custom`
+## 输入项
 
-`diy-part1.sh` 把包放进 `package/custom/` 就够了 —— `prepare-tmpinfo` 直接扫
-`package/` 目录树（`find -L package -maxdepth 5 -name Makefile`），深度 3 的
-`package/custom/<pkg>/Makefile` 必然被扫到，**不需要注册 feed**。
+### `build-ponwrt.yml`
 
-日志里出现 `⚠ package/feeds/custom 不存在` 是**正常现象**，不是索引失败：
-`scripts/feeds` 的 `install_src()` 发现包已经 installed（就是上面那份扫出来的）
-就直接返回，不会建符号链接。旧版本往 `feeds/luci/applications` 拷贝的兜底也已删除
-（luci 是 git feed，拷进去下次 `feeds update -a` 就会被冲掉）。
-
-> 强制重建索引时必须连 `tmp/info/.scan-*.stamp` 一起删。`prepare-tmpinfo` 有
-> `scan_unchanged` 优化，stamp 还在且没有更新的 Makefile 时会跳过扫描，
-> 于是 `tmp/.packageinfo` 被删了却没人重建。
-
-### diy-part1.sh —— 拉插件
-
-**默认开启**：
-
-| 开关 | 包 | 作用 |
-|------|-----|------|
-| `ADD_AIROHA_NPU` | `luci-app-airoha-npu` | Airoha SoC 状态页：NPU 卸载 / CPU 频率与超频 / Frame Engine / PPE 流表 |
-
-另外 CI 仓库自带两个本地包（`packages/`，不走 clone，由 diy-part1.sh 拷进 `package/custom`）：
-
-| 包 | 作用 |
-|-----|------|
-| `luci-app-pon-status` | PON 光模块卡片：**温度 / 收光 / 发光 / 偏置电流 / 供电电压**，表格形式显示在概览页「系统」下一格 |
-| `luci-app-natmode` | NAT 类型三选一：**全锥形 NAT1 / 受限型 NAT3 / 全对称型 NAT4**，菜单「网络 → NAT 类型」 |
-
-其余默认关闭：`ADD_PASSWALL` / `ADD_OPENCLASH` / `ADD_MOSDNS` / `ADD_LUCKY` /
-`ADD_TAILSCALE` / `ADD_OPENLIST` / `ADD_SMARTDNS`。
-
-### luci-app-airoha-npu 的源与中文
-
-**源仓库：`luanmuc/luci-app-airoha-npu`**（`rchen14b` 的 fork 改进版）：
-
-| | rchen14b（原版）| luanmuc（本仓库选用）|
+| 输入 | 取值 | 说明 |
 |---|---|---|
-| 中文翻译 | ❌ po/ 只有 es + templates | ✅ 自带 `po/zh_Hans`，48 条全翻 |
-| 仓库结构 | ⚠ 根目录 + 同名子目录各一份，feed 索引会中断 | ✅ 单层，正常 |
-| luci.mk 路径 | 需 feeds 在固定位置 | ✅ 已修 |
+| `source` | `pbs05/ponwrt` / `fork` | 编译哪个源码仓库。**必须和缓存预热时选的一致**，否则前缀对不上 |
+| `branch` | 默认 `master` | |
+| `soc` | `an7581` / `an7583` | |
+| `profile` | 见下方机型表，`all` = 全机型 | 写错会在 `Validate configuration` 直接报错退出，不会静默全编 |
+| `scope` | `firmware` / `toolchain-only` | 后者只建工具链缓存，不出固件、不发 Release |
+| `prebuilt_host` | `true`（默认）/ `false` | `true` 用 runner 的 Go/Rust/LLVM，快 1.5~2.5 小时；`false` 全部从源码编，产物可复现 |
+| `ignore_cache` | `false` / `true` | 跳过缓存恢复强制重编（仍会存新一代） |
+| `upload_release` | `true` / `false` | `false` 只留 Artifact |
+| `opt_arm64ce` / `opt_chacha` / `opt_eip93` | `0` / `1` | 加密加速，见文末 |
 
-## 固件版本后追加「作者 + 构建时间」
+### 四个工作流
 
-LuCI 概览页「固件版本」现在长这样：
-
-```
-PonWrt SNAPSHOT · qwe3017 · 2026-09-30 17:09
-```
-
-### 原理（别改错文件）
-
-LuCI 读的是 `/etc/openwrt_release` 里的 `DISTRIB_DESCRIPTION`。这个文件由
-`base-files` 提供，编译时装完 ipk 后用 `VERSION_SED_SCRIPT` 把模板里的占位符替换：
-
-| 占位符 | 含义 | ponwrt 默认 |
+| 工作流 | 触发 | 作用 |
 |---|---|---|
-| `%D` | `VERSION_DIST` | `PonWrt` |
-| `%V` | `VERSION_NUMBER` | `SNAPSHOT` |
-| `%C` | `VERSION_CODE` | 空 |
-
-所以改的是**模板** `package/base-files/files/etc/openwrt_release`
-（`diy-part2.sh` 第 5 段），编译时自动替换 —— 不需要首启脚本，也不会被 ipk 覆盖。
-
-> 不要写 `files/etc/openwrt_release`：那会把版本号写死，`%D %V` 就没了。
-> `os-release` 里的 `%B` 只有 `SOURCE_DATE_EPOCH` 时间戳，不可读，所以构建
-> 时间由脚本自己格式化。
-
-### 怎么改
-
-| 方式 | 做法 |
-|---|---|
-| 换作者名 | workflow 输入项 `fw_author`（默认 `qwe3017`） |
-| 固定构建时间 | 环境变量 `FW_BUILD_TIME`（留空 = 自动取构建时刻，Asia/Shanghai） |
-| 完全自定义后缀 | 环境变量 `FW_DESC_SUFFIX`（填了就忽略上面两个，例如 `\| built by A/B #1`） |
-| 改 `diy-part2.sh` 顶部常量 | 同上三个常量，编译期生效 |
-
-`FW_DESC_SUFFIX` 里带 `/` `|` `#` `&` 也没问题 —— 脚本用 perl + 环境变量传
-替换文本，不走 sed 分隔符。
-
-若 `.config` 里设了 `CONFIG_VERSION_CODE`，模板会自动保留 `%C`，不会出现连续空格。
-
-## 5G WiFi 默认值（国家码 CN / 信道 auto / 160MHz）
-
-由 `diy-part2.sh` 第 4 段实现，落在
-`files/etc/uci-defaults/96-wifi-5g-cn`（**首启执行**）。
-
-### 默认值
-
-| 选项 | 值 |
-|---|---|
-| `country` | `CN`（中国） |
-| `country_ie` | `1`（beacon 中广播国家码） |
-| `channel` | `auto`（自动选信道 / ACS） |
-| `htmode` | `HE160`（160MHz，WiFi 6）；不支持则回落 `HE80` |
-
-编辑 `diy-part2.sh` 顶部的编译期常量（会被注入 uci-defaults 脚本）：
-
-```bash
-WIFI_5G_COUNTRY="${WIFI_5G_COUNTRY:-CN}"
-WIFI_5G_CHANNEL="${WIFI_5G_CHANNEL:-auto}"
-WIFI_5G_HTMODE="${WIFI_5G_HTMODE:-HE160}"
-WIFI_5G_FALLBACK="${WIFI_5G_FALLBACK:-HE80}"
-```
-
-也支持 workflow 层通过环境变量覆盖。
-
-### 注意事项
-
-- **DFS**：CN 法规下 160MHz 需要信道 36–64，其中 52–64 属 DFS 信道。
-  ACS 若选中，启动时会先做雷达检测（CAC），**WiFi 可能延迟 1–10 分钟才出现**
-  或自动跳频。这是正常现象，不是故障。
-
-## PON 光模块卡片（概览页系统下一格）
-
-`packages/luci-app-pon-status`（本地包，非第三方 clone）在概览页新增
-「PON 光模块」卡片，位置为**「系统」卡片的下一格**。
-
-### 显示内容
-
-| 字段 | 来源字段 | 单位 |
-|------|---------|------|
-| 收光功率 | `rx_power_dbm` | dBm |
-| 发光功率 | `tx_power_dbm` | dBm |
-| 光模块温度 | `temperature_celsius` | °C |
-| 偏置电流 | `tx_bias_ma` | mA |
-| 供电电压 | `voltage_volts` | V |
-
-### 开关：SHOW_PON_OPTICS
-
-`tempinfo` 顶部有一个开关：
-
-```sh
-SHOW_PON_OPTICS=1    # 温度行附带 PON 光功率/电流/电压
-SHOW_PON_OPTICS=0    # 只显示温度（CPU / WiFi / PON）
-```
-
-设为 `0` 时输出：`CPU: 58.7°C, WiFi: 46.0°C 48.0°C, PON: 48.5°C`
-
-本仓库**默认设为 `0`**，因为 `luci-app-pon-status` 卡片已用表格形式完整展示
-收发光/电流/电压，两者会重复。若你想只要一行、不装 pon-status 卡片，改回 `1` 即可。
-
-### 一点开销说明
-
-概览页轮询间隔 3 秒，故 `tempinfo` 每 3 秒执行一次 `ponctl`。
-`ponctl` 是 Rust 二进制、只读 sysfs，开销可忽略。
-但注意 `luci-app-pon-status` 卡片同样每 3 秒调一次 `ponctl`，
-两者叠加即约每 1.5 秒一次 `ponctl` 调用 —— 若在意，把 `SHOW_PON_OPTICS` 设 `0` 即可减半。
-
-## Release 行为
-
-- 只有 `scope=firmware` 且编译成功才发 Release；`toolchain-only` 不发。
-- 空固件目录会跳过，不会发空 Release。
-- `fail_on_unmatched_files: false`：机型产物后缀不同（`*.itb` / `*.ubi` / `*.bin` / `*.manifest` 等），缺哪种都不会让这一步失败。
-- 自动清理：每个机型的 Release 只保留最近 10 个（`delete_tag_pattern: ^<DEVICE_NAME>-`，不会误删 `toolchain-cache`）。
-- 关掉 Release 只留 Artifact：把 `upload_release` 选 `false`，或把 env 里 `UPLOAD_RELEASE` 默认值改成 `'false'`。
-
-> 首次运行建议先 `scope=toolchain-only`（不产固件、不发 Release）把工具链缓存建起来，再跑 `firmware`。
+| `build-ponwrt.yml` | 手动 | 恢复缓存 → 编译 → 存缓存 → 轮换旧代 |
+| `warm-cache.yml` | 手动 / 每周一 03:17 | 预热。`soc` 和 `prebuilt_host` 都是三选一，两个都选「和」的选项 = 4 个 job 并行 |
+| `cache-keepalive.yml` | 每 3 天 | 逐条真实恢复，避开 `actions/cache` 的 7 天未访问回收 |
+| `cache-clean.yml` | 手动 / 每周一 04:20 | `rollover` 每族留最新一代 / `backup` 只清 Release 备份 / `all` 全删 |
 
 ## 支持的机型
 
 | SoC | profile |
-|-----|---------|
-| AN7581 | `fiberhome_hg5382a` `fiberhome_hg5585f-ct` `fiberhome_hg5585f-cu` `gemtek_xg2010g` `nokia_xg-040g-md-ubi` `nokia_xg-040g-tf-ubi` `unionman_ung00a` `znxt_zn504xg-d` `znxt_zn515xg-d` |
+|---|---|
+| AN7581 | `fiberhome_hg5382a` `fiberhome_an4475-g2`† `fiberhome_hg5585f-ct` `fiberhome_hg5585f-cu` `gemtek_xg2010g` `nokia_xg-040g-md-ubi` `nokia_xg-040g-tf-ubi` `unionman_ung00a` `znxt_zn504xg-d` `znxt_zn515xg-d` `h3c_hm2004-du`※ |
 | AN7583 | `nokia_xg-040g-mf` `nokia_xg-040g-mf-ubi` |
 
-机型名写错会在 `Generate toolchain cache key` 步骤直接报 `::error::` 并退出，不会静默地全机型编译。
+※ `h3c_hm2004-du` 额外依赖私有仓库 `openwrt-fttr`（FTTR 驱动 / 控制端 / FPGA 固件）与 `luci-app-fttr`，缺凭证时 `diy-part1.sh` 会直接报错退出。
 
-## NPU 固件选择（stock / clanker / none）
+† `fiberhome_an4475-g2` 的板级 DTS / profile 在 **`qwe-qaq/ponwrt@master`**，构建时 `source` 必须选 `fork`（`pbs05/ponwrt` 尚未合入，会在 `Validate configuration` 阶段因机型符号不存在而失败）。`factory` UBI 卷为 **2 MiB**（AN4-2MiB 容器）。FTTR 后端三件套（`h3c-fmcs` / `openwrt-fttr` / FPGA 固件）是 HM2004-DU 专属，本机用 SoC 内置下行 PON，**不启用** `ADD_FTTR`。
 
-NPU 是 Airoha SoC 里那颗 RISC-V 核，**不是** Linux 驱动 —— host 端驱动 `airoha_npu`
-随内核编出，它按固定名字找两个固件镜像：
+## 插件开关（`diy-part1.sh`）
 
-| 镜像 | 默认文件名 | 上限 | 加载去向 |
-|---|---|---|---|
-| rv32（text+rodata） | `airoha/en7581_npu_rv32.bin`（AN7583 为 `an7583_*`） | 2 MiB | `npu_binary` @0x84000000 |
-| data（.data） | `airoha/en7581_npu_data.bin` | 64 KiB | NPU 本地 SRAM |
+全部默认开启，开关与 `configs/an7581.config` / `an7583.config` 里的 `=y` 一一对应：
 
-`npu_fw` 决定用哪一份：
-
-| 选项 | 行为 |
-|---|---|
-| `stock`（默认） | 用 ponwrt 自带包 `airoha-en7581-npu-firmware`（linux-firmware 里的镜像，MT7992 / **eagle** 数据面） |
-| `clanker` | 用 [ClankerNPU](https://github.com/ClankerConstruction/ClankerNPU) 现编，变体由 `npu_wifi` 决定 |
-| `none` | 不装任何固件（NPU 不起，只剩有线软件转发） |
-
-### ClankerNPU 固件现在是「可选插件包」
-
-`npu_fw=clanker` 不再用 `files/lib/firmware/airoha/` 覆盖 rootfs，而是生成一个标准
-OpenWrt 包放进 `package/custom/`，之后就能用 config 符号勾选：
-
-```sh
-CONFIG_PACKAGE_airoha-en7581-mt7916-npu-firmware=y
-```
-
-包命名规则 `airoha-<soc>-<wifi>-npu-firmware`：
-
-| SoC | 包名 |
-|---|---|
-| AN7581 | `airoha-en7581-mt7916-npu-firmware` / `airoha-en7581-mt7992-npu-firmware` / `airoha-en7581-mt7996-clanker-npu-firmware` |
-| AN7583 | `airoha-an7583-mt7916-npu-firmware` / `-mt7992-` / `-mt7993-` / `-mt7996-` / `-nowifi-` |
-| AN7552 | `airoha-an7552-mt7916-npu-firmware` / `-mt7991-` / `-mt7993-` |
-
-> AN7581 + MT7996 会撞上 linux-firmware 已有的 `airoha-en7581-mt7996-npu-firmware`，
-> 生成脚本会自动改名成 `airoha-en7581-mt7996-clanker-npu-firmware`，避免包符号重名。
-
-**怎么选**：工作流默认按 `npu_wifi` 推断出一个变体并自动写入 `=y`。想自己定，
-在 `configs/<机型>.config` 里直接写那一行即可 —— `Select NPU firmware package`
-步骤检测到就会沿用你的选择，不会覆盖。
-
-**为什么必须先摘 DEFAULT_PACKAGES**：`airoha-en7581-npu-firmware` 是 an7581
-subtarget 的 `DEFAULT_PACKAGE`，`make defconfig` 会把它强制拉回 `=y`，于是它和
-ClankerNPU 包同时进 rootfs —— 两个包装的是同一批文件名，谁生效取决于安装顺序。
-`scripts/strip-default-npu-fw.sh`（4.5 步）把这三个 stock 包从
-`target/linux/airoha/**` 的 `DEFAULT_PACKAGES` / `DEVICE_PACKAGES` 里摘掉，
-装哪个就完全由 `.config` 说了算。包符号本身还在，`npu_fw=stock` 照样能 `=y` 勾上。
-
-### 相关输入项
-
-| 输入 | 默认 | 说明 |
+| 开关 | 包 | 备注 |
 |---|---|---|
-| `npu_fw` | `stock` | `stock` / `clanker` / `none` |
-| `npu_wifi` | `auto` | 变体：`auto` 按机型推断，或手动选 `MT7916` `MT7992` `MT7996` `MT7991` `MT7993` `NOWIFI`；`all` = 该 SoC 所有变体都编成可选包，只默认勾一个 |
-| `npu_default_wifi` | `MT7916` | `npu_wifi=all` 时默认勾选哪个变体 |
-| `npu_clanker` | `0` | `1` = 适配 Clanker 自改的 host driver。**配 ponwrt 自带驱动必须保持 0** |
-| `npu_fw_prefix` | 空 | 固件名前缀。空 = 驱动默认名（`en7581` / `an7583`），此时不用改 DTS |
-| `npu_wlan_mem` | `true` | 给机型 DTS 补 WiFi 卸载必需的保留内存区（pkt / tx-pkt / tx-bufid / ba） |
-| `npu_src_ref` | `main` | ClankerNPU 源码 ref（`main`=跟上游最新，也可填 commit sha / tag 钉死版本） |
-| `npu_fw_files_fallback` | `false` | `true` = 额外把镜像铺进 `files/lib/firmware/airoha` 兜底（**开了以后包置 n 也会生效**，破坏可选语义，仅排查用） |
+| `ADD_AIROHA_NPU` | `luci-app-airoha-npu` | NPU 卸载 / CPU 频率 / Frame Engine / PPE 流表 |
+| `ADD_LUCI_APP` | `luci-app-natmode`、`luci-app-pon-status`、`luci-app-igmpproxy` | NAT 类型三选一、PON 光模块卡片、IGMP Proxy 组播代理 Web 界面 |
+| `ADD_FLUENT` | `luci-theme-fluent` | 与 `argon` / `bootstrap` 可共存 |
+| `ADD_PASSWALL` | `luci-app-passwall` + `xray-core` / `sing-box` | 新版 passwall 把内核做成按需安装，config 里另开了两个 feeds 现成的 |
+| `ADD_OPENCLASH` | `luci-app-openclash` | ⚠ 拖 Ruby 进构建，首次 +20~40 分钟 |
+| `ADD_MOSDNS` | `luci-app-mosdns` | 本体用 feeds 的 `mosdns` |
+| `ADD_SMARTDNS` | `luci-app-smartdns` | 本体用 feeds 的 `smartdns` |
+| `ADD_TAILSCALE` | `luci-app-tailscale` | 本体用 feeds 的 `tailscale` |
+| `ADD_LUCKY` | `luci-app-lucky` | 含 `lucky` 本体 |
+| `ADD_OPENLIST` | `luci-app-openlist2` | 含 `openlist2` 本体 |
+| `ADD_EASYTIER` | `luci-app-easytier` + `easytier` | 本体是 Rust 包，编译较慢 |
+| `ADD_POWEROFF` / `ADD_OWQ_WOL` / `ADD_WATCHDOG` / `ADD_TASKPLAN` | 同名 `luci-app-*` | |
+| `ADD_OAF` | `luci-app-oaf` + `appfilter` / `kmod-oaf` | 含内核模块 |
 
-### 可用变体（ClankerNPU 共 11 个）
+**要关掉某个插件，改两处**：脚本里 `ADD_xxx=false`，**并且**把两个通用 config 里对应的
+`CONFIG_PACKAGE_xxx=y` 删掉（或改成 `# ...is not set`）。只改一处会不一致：
+只关脚本 → `make defconfig` 把 `=y` 静默剔除；只关 config → 白 clone 一个仓库。
 
-| SoC | 可选 WiFi 芯片 |
-|---|---|
-| AN7552 | MT7916、MT7991、MT7993 |
-| AN7581 | MT7916、MT7992、MT7996 |
-| AN7583 | MT7916、MT7992、MT7993、MT7996、NOWIFI |
+**四个「只用 feeds」的包**（`MOSDNS` / `SMARTDNS` / `PASSWALL` / `TAILSCALE`）：它们的本体
+（`mosdns` / `smartdns` / `xray-core` / `sing-box` / `tailscale`）feeds 里已有同名包，
+第三方源再拉一份会让索引里出现两个同名 `Package`，`package-metadata` 按扫描顺序挑一个、
+行为不可预期。所以脚本只拷 luci 前端，本体一律用 feeds 的。
 
-`MT7916` / `MT7996` 走 **kite** 数据面，`MT7991` / `MT7992` / `MT7993` 走 **eagle**。
-组合写错会在 `Build NPU firmware` 步骤开头直接报错，不会白跑一趟编译。
+`ADD_FTTR` 及其子开关只在 `h3c_hm2004-du` 下生效，其余机型自动跳过。
 
-### 执行顺序（不能反）
+## 构建缓存（移植自 VIKINGYFY/OpenWRT-CI）
+
+一份缓存 = 三个目录：
 
 ```
-4.5  Strip stock NPU firmware   ← 摘掉 DEFAULT_PACKAGES 里的 stock 固件（必须先做）
-diy-part1.sh 拉插件
-  └─> 5.5  Build NPU firmware package   ← 现编 + 生成 package/custom/airoha-<soc>-<wifi>-npu-firmware
-                                           再 re-index custom feed（不索引符号就不存在）
-载入 .config（基座 + 机型精简配置）
-裁剪机型
-  └─> 7.5  Select NPU firmware package  ← 统一重写 CONFIG_PACKAGE_airoha-*-npu-firmware
-diy-part2.sh
-make defconfig + 校验（含 NPU 固件包符号校验）
+staging_dir/host*      host 工具 + hostpkg（go / python 在这）
+staging_dir/tool*      交叉编译器
+.ccache                编译对象缓存
 ```
 
-### 典型用法
+**tools / toolchain 会不会重编，取决于 `staging_dir` 里的 compile 戳，不取决于缓存里
+有没有 `build_dir`。** `make world` 的 `prepare` 依赖
+`staging_dir/host/stamp/.tools_compile_<flags>` 和 `staging_dir/toolchain-*/stamp/.toolchain_compile`，
+这两个戳存在且比源码树新，`tools/compile` 与 `toolchain/compile` 就整段跳过。
 
-| 场景 | 输入 |
+**但 host 包（golang / rust / python3）是另一回事。** 它们有四个戳，被拆在两处：
+`staging_dir/hostpkg/stamp/.<pkg>_installed` 跟着缓存走，而
+`build_dir/host/<pkg>/.built`、`.configured`、`.prepared_<md5>` 不在缓存路径里。
+依赖链是 `installed ← built ← configured ← prepared`，缺了 built 这一层，make 就认为没编过，
+整条链重做。**这就是 source 模式比 prebuilt 慢 20~40 分钟、多写 13~14 GB 的原因**——
+golang 和 rust 每轮都在从源码自举。
+
+所以 source 模式在编译结束时会把这三个戳单独冻一份到
+`staging_dir/host/.builddir-stamps/`（只冻戳，不冻内容：100 来个包 × 3 个空文件，
+压缩后不到 10 KB），下一轮 `prepare` 原样还原，mtime 保持不变。
+**prebuilt 模式不冻**——那里的 go/rust 是指向 runner 的符号链接，换镜像后可能悬空，
+宁可让同一条链重跑一遍自愈（`rust-prebuilt.mk` 已把 Prepare/Configure/Compile 置空，只花几秒）。
+
+**精确命中 = 这份缓存就是当前这个提交编出来的**，两条通道都算：`actions/cache` 的
+`cache-hit=true`，或 Release 资产名去掉 `.tzst` 后与本次 key 完全相同。只有精确命中时
+`prepare` 才保留这两个戳；前缀回退、或 Release 取到的是旧代，都说明源码已变，脚本会删掉
+它们迫使 make 重编（约 26 分钟，ccache 会加速）。当前提交通常在第一次构建时付这 26 分钟，
+之后同提交重跑都是 0 分钟。
+
+> 冻进去的 `build_dir` 戳不会误跳编译：`.prepared` 的文件名里带着包源码目录的内容 MD5
+> （`PKG_FILES_MD5`），上游一改源码戳名就对不上，make 自然重建。target 侧的戳则完全不在
+> 缓存里，所以固件包每轮照常重编。
+
+| 通道 | 介质 | 特点 |
+|---|---|---|
+| ① 快通道 | `actions/cache` | 秒级，但 **7 天无访问即回收** |
+| ② 备份通道 | Release `cache-backup` 资产 | 慢（~1 GB），**永不过期** |
+
+恢复 ①→②，保存时两条都写（② 失败只 warning）。key 规则：
+
+| | key |
 |---|---|
-| HG5585F-CT / ZN515XG-D 换成 kite 固件 | `npu_fw=clanker`（`npu_wifi` 自动推断为 MT7916）→ 得到 `CONFIG_PACKAGE_airoha-en7581-mt7916-npu-firmware=y` |
-| 把 AN7581 的全部变体都编成可选包 | `npu_wifi=all`，再在 configs 里挑一个写 `=y` |
-| Nokia XG-040G-MF（AN7583） | `profile=nokia_xg-040g-mf` + `npu_fw=clanker` + `npu_wifi=MT7993` |
-| 只想要有线 PPE / HWNAT 卸载 | `npu_wlan_mem=false` |
-| 完全不装固件 | `npu_fw=none` |
-| 想钉死某一版固件 | `npu_src_ref=<commit sha>`（如 `735529c10d5120e10f7e4a6ddf97fb384fce9903`） |
+| 写入 | `ponwrt-<源站>-<分支>-<SoC>-<prebuilt\|source>-<上游提交号>` |
+| 恢复 | 同上前缀 + `-`（**前缀回退**） |
 
-### 注意事项
+前缀不含配置、机型、diy 脚本——改这些不会让缓存失效；上游一提交就换一代，靠 `restore-keys` 回退到最近一代。旧代由 `cache-rollover` job 删掉，保证每个前缀只留一份。
 
-1. **`npu_clanker` 保持 0**：`CLANKER=1` 会加 `-DUSE_CLANKER_DRIVER`，是给 Clanker 自己改的
-   host driver 用的，其 Makefile 注释明说配 stock 驱动可能坏；且它只影响 eagle 的 `sta_q`
-   与 SRAM type 41 的 sizing，kite 变体开了也没差别。
-2. **工具链必须是 elf/newlib**：固件用 `-march=rv32imc_zicsr_zifencei -mabi=ilp32` 编，
-   `riscv64-linux-gnu` 编不了；脚本会自动下载 xpack `riscv-none-elf-gcc 14.2.0-3`（约 100 MB）。
-3. **data 段只有 64 KiB 上限**，比 rv32 的 2 MiB 紧得多；脚本编完先自检，超限直接失败，
-   不会编出刷上才炸的镜像。
-4. **`npu_src_ref` 默认 `main`（跟上游最新）**：好处是总能吃到 ClankerNPU 的修复，
-   代价是**不同时间跑 CI 编出的固件可能不同** —— 上游一改代码，行为就跟着变（且没法复现）。
-   出问题时建议填 commit sha 钉死，先本地编一次验证再定。
-   无论用哪种，Release 说明里都会记下当次的实际 gitrev，可以回溯这台机器刷的是哪版。
-5. **机型 → WiFi 映射表**在 `Resolve device profile` 步骤里，只登记了
-   `fiberhome_hg5585f-ct/cu` 与 `znxt_zn515xg-d/znxt_zn504xg-d`；其他机型会打 warning
-   并回退 MT7916，请手动选 `npu_wifi`。
-6. **`profile=all` + `clanker`** 只会给所有机型装同一份固件，脚本会 warning，建议按机型分别编。
-7. Release 说明里会带上 NPU 固件的 SoC / 变体 / gitrev / 可选包名 / 两个 bin 的大小，便于回溯版本。
-8. **包没进索引的表现**：`package/custom/` 下有包目录，但固件里没有固件文件，且不报错。
-   原因是 `CONFIG_PACKAGE_xxx` 符号不存在，defconfig 把 `=y` 当无效符号静默删掉。
-   5.5 步会 re-index custom feed 并打印 `package/feeds/custom/` 链接，
-   9 步在 defconfig 后强制校验符号仍为 `=y`，失败会带 5 条排查线索直接退出。
+**恢复后必须做三件事**（`scripts/pwrt-cache.sh prepare`），少一件就等于白命中：touch 非 target 的 stamp、写 `tmp/.build`、touch 目录本身。
 
-### 刷完怎么验
+**dl 缓存**（源码包，2~5 GB）单独一条，key 按周滚动 `ponwrt-dl-<源站 slug>-<分支>-<YYYYWW>`（`pbs05/ponwrt` → `pbs05-ponwrt`，与工具链 key 同一套规则）。保存在 `make download` 之后、编译之前——350 分钟一到 job 直接 cancel，放最后用 `always()` 也来不及跑。
+
+**两种 host 模式不共用缓存**：`HOST_MODE` 进前缀。prebuilt 在 `staging_dir` 里留的是指向 runner 的符号链接，source 留的是真二进制，混用会让 make 误判「已安装」并在编译期报一个完全对不上的错。**warm-cache 必须和主流程选同一个模式**，否则预热白跑。
+
+**rust 包的离线限制**：`openwrt-fttr` 的 Makefile 用 `cargo install --locked --frozen`，`--frozen` 禁止联网、只认 `dl/cargo` 里已有的 crate。`scripts/patch-cargo-offline.sh` 把 `--frozen` / `--offline` 摘掉，`--locked` 保留（版本仍锁死）。
+
+## 客制化
+
+| 位置 | 做了什么 |
+|---|---|
+| `files/sbin/cpuusage` + `scripts/patch-luci-cpuusage.sh` | 概览页 CPU 行改为 `USR: 2% SYS: 1% · CPU0 3% CPU1 0%…`（两次 `/proc/stat` 采差值，USR=`user+nice`、SYS=`system+irq+softirq`）。补丁只换 `popen()` 里一个命令字符串，前端和 ACL 都不动；任一环节失败只 warning，构建不受影响 |
+| `files/sbin/tempinfo` | 概览页温度行：CPU / WiFi / PON 三个温度。顶部 `SHOW_PON_OPTICS=1` 可附带收发光/电流/电压（默认 0，因为 `luci-app-pon-status` 卡片已经完整展示，重复） |
+| `diy-part2.sh` | 默认时区 `Asia/Shanghai`、5G 国家码 `CN` / 信道 `auto` / 频宽 `HE160`（不支持时回落到 `HE80`）、固件版本后缀追加作者与构建时间 |
+| `files/etc/uci-defaults/` | 首启强制刷时区与无线参数的兜底脚本 |
+
+## NPU 固件
+
+NPU 是 Airoha SoC 里的 RISC-V 核，host 侧驱动随内核编出，按固定名字找两个镜像：
+
+| 镜像 | 文件名 | 上限 |
+|---|---|---|
+| rv32（text+rodata） | `airoha/en7581_npu_rv32.bin`（AN7583 为 `an7583_*`） | 2 MiB |
+| data | `airoha/en7581_npu_data.bin` | 64 KiB |
+
+由 ponwrt 自带的 linux-firmware 提供，在 `configs/<机型>.config` 写 `CONFIG_PACKAGE_airoha-en7581-npu-firmware=y` 即装进 rootfs。工作流不介入固件生成——要换就改这一行。
 
 ```sh
-dmesg | grep -i npu           # probe 时打 NPU fw version，固件 boot 行带 GITREV
+dmesg | grep -i npu           # probe 时打 fw version
 ls -l /lib/firmware/airoha/   # 两个 bin 在位
 ```
 
-- 缺文件或名字不匹配：`request_firmware_direct()` 返回 `-ENOENT`，驱动映射成 `-EPROBE_DEFER`，
-  NPU 一直不绑定（`deferred probe pending` 里能看到具体文件名），不会像以前那样卡 60 秒 sysfs fallback。
-- 大小超限：直接 `-E2BIG`。
-- LuCI「Airoha SoC 状态页」（`luci-app-airoha-npu`）可看 NPU 卸载 / PPE 流表是否正常。
+缺文件或名字不符 → `-ENOENT` → 映射成 `-EPROBE_DEFER`，NPU 一直不绑定（`deferred probe pending` 里能看到具体文件名）；超限 → `-E2BIG`。
 
-## 工具链缓存机制
+## 加密加速（可选）
 
-- Key：`ponwrt-toolchain-<board>-<subtarget>-<tools/toolchain 源码 md5 前 16 位>`，源码工具链一变就失效重编。
-- 命中顺序：`actions/cache` → 仓库 `toolchain-cache` Release 备份 → 本地编译。
-- Release 命中后会回写 `actions/cache`，下次构建走快通道。
-- 命中缓存时用 `sed -i 's/ $(tool.*\/stamp-compile)//' Makefile` 跳过工具链重编。
-  （对 ponwrt 根 Makefile 确实命中第 46 / 47 / 130 行，去掉 `$(tools/stamp-compile)`、
-  `$(toolchain/stamp-compile)` 依赖。）
-- 额外缓存：`.ccache`（编译缓存）、`dl`（软件包下载目录）。
+| 开关 | 建议 | 适用 |
+|---|---|---|
+| `opt_arm64ce` | 改 `1` | IPSec / OpenVPN / TLS / dm-crypt，几乎总是开 |
+| `opt_chacha` | 改 `1` | 跑 Xray / sing-box / WireGuard |
+| `opt_eip93` | 保持 `0` | 只有大块 IPSec / 大文件 TLS 才有收益 |
 
-### 缓存 key 的滚动周期
+**AN7581 和 AN7583 不一样**：AN7581 的 `/proc/cpuinfo` 里没有 `aes`，`/proc/crypto` 只有 `aes-generic`，单核 AES-128-GCM 约 32 MB/s，只能走 NEON 位切片（`AES_ARM64_BS`）；AN7583 有 `aes pmull sha1 sha2`，同样测试约 548 MB/s，可以走 Crypto Extensions。脚本读 `.config` 自动判断，不用手动切。
 
-`dl` 与 `ccache` 的 key 都用**年+周号**（`$(date +%Y%W)`，如 `202639`），由
-`Resolve device profile` 步骤的 `week` output 提供。
+**EIP93 是个陷阱**：AN7581 确实内置（`crypto@1e004000`），但实测 AES 要 ≥512 字节才快过软件，MD5/SHA1/SHA2 在所有尺寸下都是软件更快，代理流量开着只会更慢。
 
-| 缓存 | key |
-|------|-----|
-| dl | `ponwrt-dl-<branch>-<week>` |
-| ccache | `ponwrt-ccache-<soc>-<week>` |
+验证：
 
-原因是这两个缓存**体积大且会每次 save**：
-
-- 若用 `github.run_id` / `github.run_number`，每次运行都会生成一份新副本，
-  10GB 配额很快被刷满，并淘汰掉真正有用的旧缓存；
-- 改成周号后，同一周内多次运行复用同一条目，`restore-keys` 仍能跨周命中。
-
-### ccache：默认关闭，按需开启
-
-ccache 默认**关闭**（`USE_CCACHE: false`，config 里也不写 `CONFIG_CCACHE`）。
-原因是一个真实的缓存一致性陷阱：
-
-`tools/Makefile`：
-
-```makefile
-ifneq ($(CONFIG_CCACHE)$(CONFIG_SDK),)
-  tools-y += ccache xxhash
-endif
+```sh
+grep -ao 'aes\|pmull\|sha1\|sha2' /proc/cpuinfo | sort -u   # AN7581 不会有 aes
+cat /proc/crypto | grep -E '^name|^driver|^priority'
+openssl speed -evp aes-128-gcm
+openssl speed -evp chacha20-poly1305
 ```
 
-即 **ccache 二进制只在 `CONFIG_CCACHE` 生效时才由 `make tools/install` 编入**
-`staging_dir/host/bin`。而 `rules.mk`：
+> `CONFIG_CRYPTO_*` 是**内核编译符号**，必须写进 `target/linux/airoha/an7581/config-<kver>`。写进顶层 `.config` 会被 target config 覆盖——看起来配上了，实际不生效。
 
-```makefile
-ifneq ($(CONFIG_CCACHE),)
-  TARGET_CC:= ccache $(TARGET_CC)
-  export CCACHE_DIR:=$(TOPDIR)/.ccache
-endif
-```
+## 排错
 
-于是出现这种失败：
+| 症状 | 先看哪里 |
+|---|---|
+| `defconfig` 失败 | 日志里 `make defconfig` 那段的尾部 60 行 + 根因提示（`scripts/defconfig.sh` 输出） |
+| 关键包「未启用，检查 feeds」 | 多数是上一步 defconfig 失败的连带；独立出现时查 `tmp/.packageinfo` 里有没有该包 |
+| `Failed to download` / 编译期报缺 crate | `make download` 三次都失败会直接 error 退出，去那段输出搜 `ERROR:` |
+| 缓存「命中」却仍然全量重编 | `prepare` 那步的三件事是否都做了；`Build host go/rust from source` 的 warning |
+| 缓存永远 miss | `source` / `branch` / `soc` / `prebuilt_host` 四项是否和预热时一致 |
+| `artifacts` 上传失败 | Artifact 存储配额（默认保留 90 天，几份固件就可能超） |
+| NPU 不绑定 | `dmesg \| grep -i npu`、`/lib/firmware/airoha/` 里的文件名和大小 |
 
-| 时序 | 结果 |
-|------|------|
-| 工具链缓存是**未开 ccache** 时建立的 | 缓存里没有 `staging_dir/host/bin/ccache` |
-| 之后开启 `CONFIG_CCACHE=y` + 缓存命中 | `make tools/install` 被跳过 → ccache 没被补装 |
-| 编译任何包 | `/bin/sh: 1: .../staging_dir/host/bin/ccache: not found`（**Error 127**）|
+## 已知限制
 
-要开启 ccache，**只改一处**：workflow 的 `USE_CCACHE: true`。
-流程里「Setup ccache (opt-in)」步骤会：
-
-1. 自动往 `.config` 追加 `CONFIG_CCACHE=y` 并 `make defconfig`；
-2. 检测 `staging_dir/host/bin/ccache`，缺失就 `make tools/ccache/install` 补装
-   （ccache 依赖 `xxhash` → `cmake`，首次会多花几分钟）；
-3. 补装失败则自动把 `CONFIG_CCACHE` 改回 `is not set` 并继续编译 ——
-   **绝不会因为 ccache 让整次构建失败**。
-
-> 提醒：开启后 `.ccache` 会额外占用磁盘，注意 runner 剩余空间。
-
-## 首次使用建议
-
-免费 runner 单次上限 6 小时，首次全量编译（工具链 + 内核 + 全包）大概率超时：
-
-1. 先跑一次 `scope = toolchain-only`，把工具链缓存建起来；
-2. 再跑一次 `scope = firmware` 出固件；
-3. 若仍超时，把 `configs/*.config` 里不需要的 luci-app / 语言包删掉再提交。
-
+- 只有 `scope=firmware` 且编译成功才发 Release；`toolchain-only` 不发，空固件目录会跳过。
+- Release tag 固定为 `<机型>-<分支>`，每次覆盖，所以每个机型只有一份固件，不是「保留最近 N 份」。
+- NPU 只在三层路由模式生效，纯 AP 桥接时整机吞吐会掉到 2000 Mbps 左右。
+- `repository_dispatch` 触发时所有 choice 输入都是空，走的是各 env 的回退值。
